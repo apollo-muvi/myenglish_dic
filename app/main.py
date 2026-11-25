@@ -41,6 +41,10 @@ class LookupInput(BaseModel):
     include_word_family: bool = False
 
 
+class SavedWordInput(BaseModel):
+    word: str = Field(min_length=1, max_length=60)
+
+
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -61,6 +65,9 @@ def initialize_database() -> None:
         )
         db.execute(
             "CREATE TABLE IF NOT EXISTS daily_usage (usage_date TEXT PRIMARY KEY, requests INTEGER NOT NULL DEFAULT 0)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS saved_words (word_key TEXT PRIMARY KEY, word TEXT NOT NULL, saved_at TEXT NOT NULL)"
         )
 
 
@@ -387,6 +394,37 @@ def index() -> FileResponse:
 @app.get("/healthz", include_in_schema=False)
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/api/saved")
+def list_saved_words() -> dict:
+    with connect() as db:
+        rows = db.execute(
+            "SELECT word FROM saved_words ORDER BY saved_at DESC"
+        ).fetchall()
+    return {"words": [row["word"] for row in rows]}
+
+
+@app.post("/api/saved")
+def save_word(payload: SavedWordInput) -> dict:
+    word = normalize_word(payload.word)
+    with connect() as db:
+        db.execute(
+            "INSERT INTO saved_words(word_key, word, saved_at) VALUES(?,?,?) "
+            "ON CONFLICT(word_key) DO UPDATE SET word=excluded.word, saved_at=excluded.saved_at",
+            (word.casefold(), word, datetime.now(timezone.utc).isoformat()),
+        )
+    return {"saved": True, "word": word}
+
+
+@app.delete("/api/saved/{word}")
+def remove_saved_word(word: str) -> dict:
+    normalized = normalize_word(word)
+    with connect() as db:
+        cursor = db.execute(
+            "DELETE FROM saved_words WHERE word_key=?", (normalized.casefold(),)
+        )
+    return {"saved": False, "deleted": cursor.rowcount > 0, "word": normalized}
 
 
 @app.post("/api/lookup")

@@ -8,8 +8,53 @@ const SAVED_KEY = "myenglish-dic-saved-v1";
 const RECENT_KEY = "myenglish-dic-recent-v1";
 const escapeHTML = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
 const readList = (key) => { try { const value = JSON.parse(localStorage.getItem(key) || "[]"); return Array.isArray(value) ? value : []; } catch { return []; } };
-const savedWords = () => readList(SAVED_KEY);
+let savedCache = readList(SAVED_KEY);
+const savedWords = () => savedCache;
 const isSaved = (word) => savedWords().some((item) => item.word.toLocaleLowerCase() === word.toLocaleLowerCase());
+
+async function savedApi(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: { "Content-Type": "application/json", ...options.headers },
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.detail || "收藏同步失敗，請稍後再試。");
+  return data;
+}
+
+function setSavedWords(words) {
+  savedCache = words;
+  localStorage.setItem(SAVED_KEY, JSON.stringify(words));
+  renderSaved();
+}
+
+async function syncSavedWords() {
+  try {
+    let serverWords = (await savedApi("/api/saved")).words;
+    const known = new Set(serverWords.map((word) => word.toLocaleLowerCase()));
+    for (const item of readList(SAVED_KEY)) {
+      const word = typeof item?.word === "string" ? item.word.trim() : "";
+      if (!word || known.has(word.toLocaleLowerCase())) continue;
+      try {
+        await savedApi("/api/saved", {
+          method: "POST",
+          body: JSON.stringify({ word }),
+        });
+        known.add(word.toLocaleLowerCase());
+      } catch {
+        // Ignore invalid legacy entries and continue migrating the remaining words.
+      }
+    }
+    serverWords = (await savedApi("/api/saved")).words;
+    setSavedWords(serverWords.map((word) => ({ word })));
+    return true;
+  } catch (error) {
+    renderSaved();
+    statusBox.textContent = error.message || "無法載入伺服器收藏，請重新整理再試。";
+    statusBox.hidden = false;
+    return false;
+  }
+}
 
 function linkWords(sentence) {
   return escapeHTML(sentence).replace(/\b[A-Za-z]+(?:['’][A-Za-z]+)?\b/g, (word) => `<button class="inline-word" type="button" data-word="${escapeHTML(word)}">${word}</button>`);
@@ -72,6 +117,7 @@ async function lookup(word) {
   result.innerHTML = `<div class="loading" role="status">正在查詢「${escapeHTML(word)}」…</div>`;
   button.disabled = true;
   try {
+    await savedReady;
     const response = await fetch("/api/lookup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ word, include_synonyms: document.querySelector("#include-synonyms").checked, include_word_family: document.querySelector("#include-word-family").checked }) });
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || "查詢失敗，請稍後重試。");
@@ -96,25 +142,43 @@ document.querySelector("#saved-close").addEventListener("click", () => {
   savedPanel.hidden = true;
   document.querySelector("#saved-toggle").setAttribute("aria-expanded", "false");
 });
-result.addEventListener("click", (event) => {
+result.addEventListener("click", async (event) => {
   const candidate = event.target.closest("[data-word]");
   if (candidate) return lookup(candidate.dataset.word);
   const audio = event.target.closest("[data-speak]");
   if (audio) return speak(audio.dataset.speak, audio.dataset.accent);
   const save = event.target.closest("[data-save-word]");
   if (save) {
+    if (!(await savedReady)) return;
     const word = save.dataset.saveWord;
-    const list = savedWords();
-    const next = isSaved(word) ? list.filter((item) => item.word.toLocaleLowerCase() !== word.toLocaleLowerCase()) : [{ word }, ...list];
-    localStorage.setItem(SAVED_KEY, JSON.stringify(next));
-    renderSaved();
+    const currentlySaved = isSaved(word);
+    try {
+      if (currentlySaved) {
+        await savedApi(`/api/saved/${encodeURIComponent(word)}`, { method: "DELETE" });
+      } else {
+        await savedApi("/api/saved", {
+          method: "POST",
+          body: JSON.stringify({ word }),
+        });
+      }
+      const next = currentlySaved
+        ? savedWords().filter((item) => item.word.toLocaleLowerCase() !== word.toLocaleLowerCase())
+        : [{ word }, ...savedWords()];
+      setSavedWords(next);
+      statusBox.hidden = true;
+    } catch (error) {
+      statusBox.textContent = error.message || "收藏儲存失敗，請再試一次。";
+      statusBox.hidden = false;
+      return;
+    }
     const current = result.querySelector(".save-button");
-    current.classList.toggle("is-saved", next.some((item) => item.word.toLocaleLowerCase() === word.toLocaleLowerCase()));
+    current.classList.toggle("is-saved", isSaved(word));
     current.textContent = isSaved(word) ? "★ 已收藏" : "☆ 收藏";
   }
 });
 document.querySelector("#saved-words").addEventListener("click", (event) => { const item = event.target.closest("[data-word]"); if (item) lookup(item.dataset.word); });
 document.querySelector("#recent-words").addEventListener("click", (event) => { const item = event.target.closest("[data-word]"); if (item) lookup(item.dataset.word); });
+const savedReady = syncSavedWords();
 renderSaved();
 renderRecent();
 const initialWord = new URLSearchParams(location.search).get("word");
